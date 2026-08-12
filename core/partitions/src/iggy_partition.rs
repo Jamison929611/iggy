@@ -36,7 +36,7 @@ use crate::{
     PollingConsumer,
 };
 use consensus::{
-    CommitLogEvent, Consensus, PartitionDiagEvent, Pipeline, PipelineEntry, PlaneKind, Project,
+    CommitLogEvent, Consensus, PartitionDiagEvent, PipelineEntry, PlaneKind, Project,
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
     ack_quorum_reached, build_deny_reply_from_request, build_reply_from_request,
     build_reply_message, drain_committable_prefix, emit_namespace_progress_event,
@@ -2024,11 +2024,9 @@ where
                 // Two-queue: prepare slot -> project+replicate; prepare full +
                 // request room -> buffer; both full -> drop+warn (client retries
                 // via read-timeout).
-                if consensus.pipeline().borrow().is_full() {
-                    let push_result = consensus
-                        .pipeline()
-                        .borrow_mut()
-                        .push_request(consensus::RequestEntry::new(message));
+                if consensus.pipeline_is_full() {
+                    let push_result =
+                        consensus.push_queued_request(consensus::RequestEntry::new(message));
                     if push_result.is_err() {
                         emit_partition_diag(
                             tracing::Level::WARN,
@@ -2082,7 +2080,7 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn drain_request_queue_into_prepares(&mut self, slots_freed: usize) {
         for _ in 0..slots_freed {
-            let req = self.consensus().pipeline().borrow_mut().pop_request();
+            let req = self.consensus().pop_queued_request();
             let Some(req) = req else { break };
 
             let prepare = {
@@ -2351,7 +2349,7 @@ where
                 SimEventKind::NamespaceProgressUpdated,
                 &ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
                 header.op,
-                consensus.pipeline().borrow().len(),
+                consensus.pipeline_len(),
             );
         }
 
@@ -2377,11 +2375,7 @@ where
                 return;
             }
 
-            let pipeline = consensus.pipeline().borrow();
-            if pipeline
-                .entry_by_op_and_checksum(header.op, header.prepare_checksum)
-                .is_none()
-            {
+            if !consensus.pipeline_holds_entry(header.op, header.prepare_checksum) {
                 emit_partition_diag(
                     tracing::Level::DEBUG,
                     &PartitionDiagEvent::new(
@@ -2411,7 +2405,7 @@ where
                 SimEventKind::NamespaceProgressUpdated,
                 &ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
                 consensus.commit_min(),
-                consensus.pipeline().borrow().len(),
+                consensus.pipeline_len(),
             );
         }
     }
@@ -2444,7 +2438,7 @@ where
                 SimEventKind::NamespaceProgressUpdated,
                 &ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
                 consensus.commit_min(),
-                consensus.pipeline().borrow().len(),
+                consensus.pipeline_len(),
             );
         }
     }
@@ -2951,7 +2945,7 @@ where
 
             self.consensus.advance_commit_min(prepare_header.op);
 
-            let pipeline_depth = self.consensus.pipeline().borrow().len();
+            let pipeline_depth = self.consensus.pipeline_len();
             let event = CommitLogEvent {
                 replica: ReplicaLogContext::from_consensus(&self.consensus, PlaneKind::Partitions),
                 op: prepare_header.op,
@@ -5186,7 +5180,7 @@ mod tests {
             );
         }
         assert_eq!(
-            partition.consensus().pipeline().borrow().len(),
+            partition.consensus().pipeline_len(),
             0,
             "denied delete must not replicate"
         );
@@ -5201,7 +5195,7 @@ mod tests {
             .on_request(delete_offset_request(client_id, 8, consumer_id))
             .await;
         assert_eq!(
-            partition.consensus().pipeline().borrow().len(),
+            partition.consensus().pipeline_len(),
             1,
             "existing offset delete must replicate"
         );
